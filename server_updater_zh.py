@@ -1,7 +1,7 @@
 PLUGIN_ID = 'server_updater'
 PLUGIN_METADATA = {
     'id': PLUGIN_ID,
-    'version': '0.1.0',
+    'version': '0.2.0-alpha1',
     'name': 'Server Updater',
     'description': '自动检查并获取服务端更新',
     'author': 'Ra1ny_Yuki',
@@ -35,7 +35,9 @@ default_config = {
     'enableAutoUpdate': False,
     'autoUpdateTime': '04:00:00',
     'checkSnapshot': False,
-    'checkInterval': 30,
+    'retryInterval': 30,
+    'serverPath': 'default',
+    'verbose': False,
     'permission': {
         'reload': 2,
         'status': 1,
@@ -49,7 +51,7 @@ rule_description = {
     'enableAutoUpdate': ['启用自动更新', 'bool'],
     'autoUpdateTime': ['每日自动检查更新时间', 'time'],
     'checkSnapshot': ['是否检查快照版本更新', 'bool'],
-    'checkInterval': ['自动检查更新时有人的再次重试时间/min', 'int']
+    'retryInterval': ['自动检查更新时有人的再次重试时间/min', 'int']
     }
 config = {}
 general_lock = Lock()
@@ -62,12 +64,14 @@ class pendingUpdate:
         self.snapshot = config['checkSnapshot']
         self.refresh_latest()
 
-    def is_outdated(self, snapshot = False):        
+    def is_outdated(self):        
         self.refresh_latest()
+        current_version = get_server_version()
         target_version = self.latest_release
-        if snapshot:
+        if config['checkSnapshot']:
             target_version = self.latest_snapshot
-        if config != target_version:
+        debug_log(f'target: {target_version} current: {current_version}')
+        if current_version != target_version and current_version != 'N/A':
             return target_version
         return False
 
@@ -130,6 +134,13 @@ def output_log(msg: str):
         log.write(datetime.datetime.now().strftime("[%Y-%m-%d %H:%M:%S]") + msg + '\n')
     print("[MCDR] " + datetime.datetime.now().strftime("[%H:%M:%S]") + ' [{}/\033[1;32mINFO\033[0m] '.format(PLUGIN_METADATA['id']) + msg)
 
+def debug_log(msg: str):
+    if config['verbose']:
+        msg = msg.replace('§r', '').replace('§d', '').replace('§c', '').replace('§6', '').replace('§e', '').replace('§a', '')
+        with open(os.path.join(log_path), 'a+') as log:
+            log.write(datetime.datetime.now().strftime("[%Y-%m-%d %H:%M:%S]") + msg + '\n')
+        print("[MCDR] " + datetime.datetime.now().strftime("[%H:%M:%S]") + ' [{}/\033[1;36mDEBUG\033[0m] '.format(PLUGIN_METADATA['id']) + msg)
+
 def get_source_name(source: CommandSource):
     if source.is_player:
         return source.player
@@ -149,19 +160,23 @@ def get_config():
     need_update_keylist = list()
     for key, value in default_config.items():
         try:
-            if content.get(key) == None:
-                content[key] = value
-                need_update_keylist.append(key)
-        except:
+            content[key]
+        except KeyError:
+            content[key] = value
+            need_update_keylist.append(key)
+        except TypeError:
             need_update_keylist[0] = 'rua'
             content = default_config
+        except Exception:
+            output_log('Error loading config. Error Info: ')
+            raise
             
     if len(need_update_keylist) > 0:
         if need_update_keylist[0] != 'rua':
             output_log('Using default value for missing keys: ' + str(need_update_keylist).strip('[]'))
         else:            
             output_log('Error decoding config file, using default')
-        with open(config_file, 'w', encoding = 'UTF-8') as file:
+        with open(config_path, 'w', encoding = 'UTF-8') as file:
             yaml.round_trip_dump(content, file, allow_unicode = True, encoding = 'UTF-8')
     config.update(content)
          
@@ -178,18 +193,20 @@ def write_config(key: str, value = None):
 
 def replace_server(target_version: str):
     current_version = get_server_version()
+    if current_version == 'N/A':
+        output_log('The file you specified is not a valid vanilla server file. Execution interrupted and restarting...')
+        return    
     backup_path = os.path.join(backup_folder, current_version + '.jar')
     shutil.move(server_path, backup_path)
     target_path = os.path.join(backup_folder, target_version + '.jar')
     shutil.move(target_path, server_path)
+    output_log('Replaced server file. Restarting...')
 
 @new_thread(PLUGIN_ID)   
 def download_server(version: str, loop = 0):
-    try:
+    if loop == 0:
         general_lock.acquire(blocking = False)
-    except:
-        pass
-    if os.path.isdir(backup_folder):
+    if not os.path.isdir(backup_folder):
         os.makedirs(backup_folder)
     target_path = os.path.join(backup_folder, version + '.jar')
     if os.path.isfile(target_path):
@@ -210,7 +227,8 @@ def download_server(version: str, loop = 0):
             download_server(version, loop)
     else:
         output_log('Download {} server successfully')
-    general_lock.release()
+    if loop == 0:
+        general_lock.release()
 
 def sha1_check(file: str, hash: str):
     sha1 = hashlib.sha1()
@@ -219,11 +237,14 @@ def sha1_check(file: str, hash: str):
     return sha1.hexdigest() == hash
 
 def get_server_version():
-    server_file = ZipFile(server_path)
-    with getServerJSON(server_file):
-        with open(os.path.join(data_folder, 'version.json'), 'r', encoding = 'UTF-8') as f:
-            version = json.load(f)['id']
-    return version
+    try:
+        server_file = ZipFile(server_path)    
+        with getServerJSON(server_file):
+            with open(os.path.join(data_folder, 'version.json'), 'r', encoding = 'UTF-8') as f:
+                version = json.load(f)['id']
+        return version
+    except:
+        return 'N/A'
 
 def rule_info(rule: str, value = None):
     old_value = config[rule]
@@ -233,18 +254,19 @@ def rule_info(rule: str, value = None):
     content = RText(str(current_value), RColor.yellow, RStyle.bold)
     if value:
         content += RText(str(old_value), RColor.red, RStyle.strikethrough).set_click_event(RAction.run_command, f'{prefix} {rule} {old_value}').set_hover_text('点击此处撤销更改')    
-    return RText(f'{rule_description[rule][0]}({rule})').set_hover_text('点此补全命令').set_click_event(RAction.suggest_command, f'{prefix} {rule} ') + '\n当前值: ' + content + ' 默认值: ' + RText(default_config[rule], RColor.gray, RStyle.underlined).set_click_event(RAction.run_command, f'{prefix} {rule} {default_config[rule]}').set_hover_text('点击此处应用默认值')
+    return RText(f'§l{rule_description[rule][0]}§r(§b{rule}§r)').set_hover_text('点此补全命令').set_click_event(RAction.suggest_command, f'{prefix} {rule} ') + '\n当前值: ' + content + ' 默认值: ' + RText(default_config[rule], RColor.gray, RStyle.underlined).set_click_event(RAction.run_command, f'{prefix} {rule} {default_config[rule]}').set_hover_text('点击此处应用默认值')
     
 @new_thread(PLUGIN_ID)
 def reload_config(source: CommandSource):
     get_config()
     global update
     update = pendingUpdate()
+    init_scheduler(source.get_server())
     print_message(source, '重载配置文件完成')
 
 @new_thread(PLUGIN_ID)
 def check_status(source: CommandSource):
-    current, release, snapshot = update.status()
+    current, release, snapshot = update.refresh_latest().status()
     listtext = RTextList()
     listtext.append(f'''§l服务端版本信息如下: §r
 §a当前服务端版本§r: {current}
@@ -279,10 +301,10 @@ def auto_check(server: ServerInterface):
                 server.say('文件多次完整性校验失败, 自动更新中止')
             else:
                 server.say('文件下载完成, 即将开始更新')
-                _excute_update()
+                _excute_update(server, target_version)
         else:
             server.say(f'检查到有新版本{target_version}(已下载), 即将重启执行更新任务')
-            _excute_update()
+            _excute_update(server, target_version)
     elif not target_version and update_lock.locked():
         server.say('已有正在执行的更新任务了, 自动更新中止')
     else:
@@ -293,16 +315,18 @@ def _excute_update(server: ServerInterface, target_version: str, first_try = Tru
     if empty:
         excute_update(server, target_version)
     elif not empty and first_try:
+        debug_log('There\'s still player(s) remaining! Update will retry after {} minute(s)'.format(config['retryInterval']))
         server.say(f'仍有未下线的玩家, 任务已暂停, §e{config["retryInterval"]}§r分钟后再次尝试')
-        interval_trigger = IntervalTrigger(seconds = int(60 * config['retryInterval']))
-        sched.add_job(_excute_update, interval_trigger, args = (server, target_version, False), id = 'wait')
+        sched.add_job(_excute_update, 'interval', args = (server, target_version, False), id = 'wait', seconds = int(60 * config['retryInterval']))
+        if not sched.running:
+            sched.resume_job('')
     else:
         server.say(f'仍有未下线的玩家, 任务已中止')
     if not first_try:
         sched.remove_job('wait')
         
 def is_player_in(server: ServerInterface):
-    return parse(server.rcon_query('list'), 'There are {number} of a max of {} players online: {}')['number'] != '0'
+    return len(server.rcon_query('list').split(' players online:')[1].strip().split(', ')) > 0
 
 @new_thread(PLUGIN_ID)
 def update_now(source: CommandSource):
@@ -314,7 +338,7 @@ def update_now(source: CommandSource):
         print_message(source, '已经在进行更新操作了, 请勿重复请求')
         return
     required = True
-    print_message(source, rclick('使用§7{0} confirm§r 确认§c更新§r '.format(prefix), '点此确认立即更新', f'!!{prefix} confirm') + rclick(',使用§7{0} abort§r 取消'.format(prefix), '点击取消', '{0} abort'.format(prefix)))
+    print_message(source, rclick('使用§7{0} confirm§r 确认§c更新§r '.format(prefix), '点此确认立即更新', f'{prefix} confirm') + rclick(',使用§7{0} abort§r 取消'.format(prefix), '点击取消', '{0} abort'.format(prefix)))
 
 @new_thread(PLUGIN_ID)
 def confirm_update(source: CommandSource, confirm = True):
@@ -329,6 +353,8 @@ def confirm_update(source: CommandSource, confirm = True):
     else:
         required = False
         print_message(source, '即将开始更新, 请勿关闭服务端', tell = False)
+        if sched.get_job('wait'):
+            sched.remove_job('wait')
         _update_now(source)
 
 @new_thread(PLUGIN_ID)
@@ -337,7 +363,7 @@ def _update_now(source: CommandSource):
     update_lock.acquire(blocking = True)
     target_version = update.refresh_latest().is_outdated()
     if not target_version:
-        server.say('当前版本已是最新版')
+        server.say('§c当前版本已是最新版或查询不到当前服务端版本§r')
         return
     target_file = os.path.join(backup_folder, target_version + '.jar')
     if not os.path.isfile(target_file):
@@ -348,19 +374,20 @@ def _update_now(source: CommandSource):
     else:
         server.say('该版本服务端已下载, 将直接开始更新')
     output_log(f'{get_source_name(source)} started server update manually. Target version: {target_version}')
-    excute_update(source, target_version)
+    excute_update(server, target_version)
     update_lock.release()
     
 def excute_update(server: ServerInterface, target_version):
+    output_log(f'Start updating server to {target_version}')
     num = 5
     while num > 0:
         num -= 1
         server.say(f'§c{num}秒将重启服务端执行更新任务§r')
+        debug_log(f'Restarting: {num}...')
     server.stop()
     output_log('Waiting for server stop!')
     server.wait_for_start()
     replace_server(target_version)
-    output_log('Replaced server file. Restarting...')
     server.start()
 
 @new_thread(PLUGIN_ID)
@@ -455,21 +482,29 @@ def register_stuffs(server: ServerInterface):
             then(QuotableText('value').runs(lambda src, ctx: change_rule(src, ctx['rule'], ctx['value'])))))
     server.register_help_message(prefix, '服务端自动更新管理')
 
-def get_path(server: ServerInterface):
-    global data_folder, config_path, log_path, server_path, backup_folder
+def get_general_path(server: ServerInterface):
+    global data_folder, config_path, log_path, backup_folder
     data_folder = server.get_data_folder()
     config_path = os.path.join(data_folder, config_file)
     log_path = os.path.join(data_folder, log_file)
+    backup_folder = os.path.join(data_folder, 'servers')
+
+def get_server_path():
+    global server_path
     with open('config.yml', 'r', encoding = 'UTF-8') as f:
         content = yaml.round_trip_load(f)
     server_folder = content['working_directory']
-    server_file = content['start_command'].split(' ')[content['start_command'].split(' ').index('-jar') + 1]
+    if not config['serverPath'].endswith('.jar'):
+        server_file = content['start_command'].split(' ')[content['start_command'].split(' ').index('-jar') + 1]
+    else:
+        server_file = config['serverPath']
     server_path = os.path.join(server_folder, server_file)
-    backup_folder = os.path.join(data_folder, 'servers')
+    debug_log(f'Server JAR path: {server_path}')
 
 def on_load(server: ServerInterface, prev_module):
-    get_path(server)
+    get_general_path(server)
     get_config()
+    get_server_path()
     global update
     update = pendingUpdate()
     init_scheduler(server)
