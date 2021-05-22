@@ -1,7 +1,7 @@
 PLUGIN_ID = 'server_updater'
 PLUGIN_METADATA = {
     'id': PLUGIN_ID,
-    'version': '0.2.0-alpha1',
+    'version': '0.2.0-alpha2',
     'name': 'Server Updater',
     'description': '自动检查并获取服务端更新',
     'author': 'Ra1ny_Yuki',
@@ -18,24 +18,29 @@ from urllib.request import urlopen, urlretrieve
 from mcdreforged.api.all import *
 from zipfile import ZipFile
 from threading import Lock
-from parse import parse
 from ruamel import yaml
 import datetime
 import hashlib
 import shutil
 import json
+import time
 import os
 import re
 
+# 可配置项开始
 config_file = 'config.yml'
 log_file = 'update_log.log'
+backup_dir = 'servers'
 prefix = '!!update'
+# 可配置项结束, 非此范围内的东西, 除非你知道你在干嘛, 勿动
 
 default_config = {
     'enableAutoUpdate': False,
     'autoUpdateTime': '04:00:00',
     'checkSnapshot': False,
     'retryInterval': 30,
+    'playerInterruptTimes': 1,
+    'hashFailRetryTimes': 0,
     'serverPath': 'default',
     'verbose': False,
     'permission': {
@@ -45,19 +50,20 @@ default_config = {
         'disable': 2,
         'now': 2,
         'rule': 2
-    },
-}
+    },}
 rule_description = {
     'enableAutoUpdate': ['启用自动更新', 'bool'],
     'autoUpdateTime': ['每日自动检查更新时间', 'time'],
     'checkSnapshot': ['是否检查快照版本更新', 'bool'],
-    'retryInterval': ['自动检查更新时有人的再次重试时间/min', 'int']
-    }
+    'playerInterruptRetryTimes': ['服务器有人时自动更新中止重试次数(必须大于0)', 'int'],
+    'hashFailRetryTimes': ['下载服务端哈希校验失败重试次数(必须大于0)', 'int'],
+    'retryInterval': ['自动检查更新时有人的再次重试时间/min', 'int']}
 config = {}
 general_lock = Lock()
 update_lock = Lock()
+sched = None
 required = False
-bool_limit = {'true': True, 'True': True, 'false': False, 'False': False}
+bool_limit = {'true': True, 'false': False}
 
 class pendingUpdate:
     def __init__(self):
@@ -106,6 +112,11 @@ def rclick(message: str, hover_text: str, click_content: str, click_event = RAct
 def access_api(url):
     return json.loads(urlopen(url).read().decode('utf8'))
 
+@new_thread(PLUGIN_ID)
+def cmd_error(source: CommandSource):
+    print_message(source, rclick('§c指令错误§r, 点此获取帮助信息', '获取帮助信息', prefix))
+
+@new_thread(PLUGIN_ID)
 def show_help(source: CommandSource):
     help_message = f'''---- MCDR {PLUGIN_METADATA['name']} v{PLUGIN_METADATA['version']} ----
 {PLUGIN_METADATA['description']}
@@ -152,32 +163,27 @@ def get_config():
     if not os.path.isdir(data_folder):
         os.makedirs(data_folder)
     if not os.path.isfile(config_path):
-        with open(config_path, 'w', encoding = 'UTF-8') as file:
-            yaml.round_trip_dump(default_config, file, allow_unicode = True, encoding = 'UTF-8')
-    with open(config_path, 'r', encoding = 'UTF-8') as file:
-        content = yaml.round_trip_load(file)
-
+        with open(config_path, 'w', encoding = 'UTF-8') as f:
+            yaml.round_trip_dump(default_config, f, allow_unicode = True, encoding = 'UTF-8')
     need_update_keylist = list()
+    try:
+        with open(config_path, 'r', encoding = 'UTF-8') as f:
+            content = yaml.round_trip_load(f)
+    except:
+        content = default_config.copy()
+        need_update_keylist[0] = 'rua'
+        output_log('Error decoding config file, using default')
+
     for key, value in default_config.items():
-        try:
-            content[key]
-        except KeyError:
+        if not key in content.keys():
             content[key] = value
             need_update_keylist.append(key)
-        except TypeError:
-            need_update_keylist[0] = 'rua'
-            content = default_config
-        except Exception:
-            output_log('Error loading config. Error Info: ')
-            raise
             
     if len(need_update_keylist) > 0:
         if need_update_keylist[0] != 'rua':
-            output_log('Using default value for missing keys: ' + str(need_update_keylist).strip('[]'))
-        else:            
-            output_log('Error decoding config file, using default')
-        with open(config_path, 'w', encoding = 'UTF-8') as file:
-            yaml.round_trip_dump(content, file, allow_unicode = True, encoding = 'UTF-8')
+            output_log('Applied default value for missing keys: ' + str(need_update_keylist).strip('[]'))
+        with open(config_path, 'w', encoding = 'UTF-8') as f:
+            yaml.round_trip_dump(content, f, allow_unicode = True, encoding = 'UTF-8')
     config.update(content)
          
 def write_config(key: str, value = None):
@@ -209,22 +215,30 @@ def download_server(version: str, loop = 0):
     if not os.path.isdir(backup_folder):
         os.makedirs(backup_folder)
     target_path = os.path.join(backup_folder, version + '.jar')
+    debug_log('Starting download, file name: ' + target_path)
     if os.path.isfile(target_path):
         os.remove()
-    js = access_api('https://launchermeta.mojang.com/mc/game/version_manifest.json')
-    for version_info in js['versions']:
-        if version_info['id'] == version:
-            verion_js = access_api(version_info['url'])
-            break
+    try:
+        js = access_api('https://launchermeta.mojang.com/mc/game/version_manifest.json')
+        for version_info in js['versions']:
+            if version_info['id'] == version:
+                verion_js = access_api(version_info['url'])
+                break
+    except:
+        output_log('Exception occured while fetching data from Mojang API. Interrupted.')
+        if general_lock.locked() and loop == 0:
+            general_lock.release()
+        return
     urlretrieve(verion_js['downloads']['server']['url'], target_path)
     if not sha1_check(target_path, verion_js['downloads']['server']['sha1']):
-        if loop > 3:
+        if not config['hashFailRetryTimes'] >= 0:
+            write_config('hashFailRetryTimes', 0)
+        if loop >= config['hashFailRetryTimes']:
             output_log('Hash check failed for {} too much times!'.format(version + '.jar'))
             os.remove(target_path)
         else:
             output_log('Hash check failed for {}. Retrying...')
-            loop += 1
-            download_server(version, loop)
+            download_server(version, loop + 1)
     else:
         output_log('Download {} server successfully')
     if loop == 0:
@@ -246,15 +260,17 @@ def get_server_version():
     except:
         return 'N/A'
 
-def rule_info(rule: str, value = None):
+def rule_info(rule: str, value = None) -> RTextBase:
+    server_name = rclick(f'§l{rule_description[rule][0]}§r(§b{rule}§r)', '点此补全命令', f'{prefix} {rule} ', RAction.suggest_command)
+    default_value = rclick(f'§7§n{default_config[rule]}§r', '点击此处应用默认值', f'{prefix} {rule} {default_config[rule]}')
     old_value = config[rule]
     current_value = old_value
     if value:
         current_value = value
-    content = RText(str(current_value), RColor.yellow, RStyle.bold)
+    content = f'§e§l{str(current_value)}'
     if value:
-        content += RText(str(old_value), RColor.red, RStyle.strikethrough).set_click_event(RAction.run_command, f'{prefix} {rule} {old_value}').set_hover_text('点击此处撤销更改')    
-    return RText(f'§l{rule_description[rule][0]}§r(§b{rule}§r)').set_hover_text('点此补全命令').set_click_event(RAction.suggest_command, f'{prefix} {rule} ') + '\n当前值: ' + content + ' 默认值: ' + RText(default_config[rule], RColor.gray, RStyle.underlined).set_click_event(RAction.run_command, f'{prefix} {rule} {default_config[rule]}').set_hover_text('点击此处应用默认值')
+        content += rclick(f'§c§m{str(old_value)}', '点击此处撤销更改', f'{prefix} {rule} {old_value}')
+    return server_name + '\n当前值: ' + content + ' 默认值: ' + default_value
     
 @new_thread(PLUGIN_ID)
 def reload_config(source: CommandSource):
@@ -292,6 +308,7 @@ def auto_check(server: ServerInterface):
     server.say(f'[ServerUpdater] 正在自动检查服务端版本更新(每日§e{config["autoUpdateTime"]}§r)')
     target_version = update.refresh_latest().is_outdated()
     if target_version and not update_lock.locked():
+        update_lock.acquire()
         if not os.path.isfile(server_path):
             server.say(f'检查到有新版本{target_version}, 正在下载, 请放心, 本插件不会在玩家未下线时进行更新')
             download_server(target_version)
@@ -305,25 +322,27 @@ def auto_check(server: ServerInterface):
         else:
             server.say(f'检查到有新版本{target_version}(已下载), 即将重启执行更新任务')
             _excute_update(server, target_version)
+        update_lock.release()
     elif not target_version and update_lock.locked():
         server.say('已有正在执行的更新任务了, 自动更新中止')
     else:
         server.say('当前服务端为最新')
 
-def _excute_update(server: ServerInterface, target_version: str, first_try = True):
+def _excute_update(server: ServerInterface, target_version: str, loop = 0):
     empty = not is_player_in(server)
     if empty:
         excute_update(server, target_version)
-    elif not empty and first_try:
+    elif not empty and loop == 0:
         debug_log('There\'s still player(s) remaining! Update will retry after {} minute(s)'.format(config['retryInterval']))
         server.say(f'仍有未下线的玩家, 任务已暂停, §e{config["retryInterval"]}§r分钟后再次尝试')
-        sched.add_job(_excute_update, 'interval', args = (server, target_version, False), id = 'wait', seconds = int(60 * config['retryInterval']))
-        if not sched.running:
-            sched.resume_job('')
+        sched.add_job(_excute_update, 'interval', args = (server, target_version, loop + 1), id = 'wait', seconds = int(60 * config['retryInterval']))
+        sched.resume_job('wait')
+        sched.pause_job('regular')
     else:
         server.say(f'仍有未下线的玩家, 任务已中止')
-    if not first_try:
+    if not loop == 0:
         sched.remove_job('wait')
+        sched.resume_job('regular')
         
 def is_player_in(server: ServerInterface):
     return len(server.rcon_query('list').split(' players online:')[1].strip().split(', ')) > 0
@@ -355,16 +374,17 @@ def confirm_update(source: CommandSource, confirm = True):
         print_message(source, '即将开始更新, 请勿关闭服务端', tell = False)
         if sched.get_job('wait'):
             sched.remove_job('wait')
+            sched.resume_job('regular')
         _update_now(source)
 
 @new_thread(PLUGIN_ID)
 def _update_now(source: CommandSource):
     server = source.get_server()
-    update_lock.acquire(blocking = True)
     target_version = update.refresh_latest().is_outdated()
     if not target_version:
         server.say('§c当前版本已是最新版或查询不到当前服务端版本§r')
         return
+    update_lock.acquire(blocking = True)
     target_file = os.path.join(backup_folder, target_version + '.jar')
     if not os.path.isfile(target_file):
         download_server(target_version)
@@ -389,59 +409,44 @@ def excute_update(server: ServerInterface, target_version):
     server.wait_for_start()
     replace_server(target_version)
     server.start()
-
-@new_thread(PLUGIN_ID)
-def cmd_error(source: CommandSource):
-    print_message(source, rclick('§c指令错误§r, 点此获取帮助信息', '获取帮助信息', prefix))
     
 @new_thread(PLUGIN_ID)
 def change_rule(source: CommandSource, rule: str, value = None):
     if not rule in rule_description.keys():
         cmd_error(source)
     elif value is None:
-        print_message(source, rule_info(rule))
+        print_message(source, '查询到下列配置项: \n' + rule_info(rule))
     else:
         lvl = config['permission']['rule']
         if lvl > source.get_permission_level():
             print_message(source, f'§c权限不足, 你想桃子呢, 需要权限等级{lvl}§r')
             return
-        invalid_value = False
-        if rule_description[rule][1] == 'bool':
-            if not value in bool_limit.keys():
-                invalid_value = True
-            else:
-                value_converted = bool_limit[value]
-        elif rule_description[rule][1] == 'time':
-            time_list = value.split(':')
-            for item in time_list:
-                try:
-                    int(item)
-                except:
-                    invalid_value = True
-            if len(time_list) != 3:
-                invalid_value = True
-            value_converted = value
-        else:
-            try:
-                value_converted = int(value)
-            except:
-                invalid_value = True
-        if invalid_value:
+        value_converted = check_value(rule_description[rule][1], value)
+        if value_converted == None:
             print_message(source, f'§c无效数值: §m{value}§r')
             return
-        print_message(source, rule_info(rule, value_converted))
+        print_message(source, '设置项已更改, 所有计时器均已重置\n' + rule_info(rule, value_converted))
         write_config(rule, value_converted)
         output_log(f'{get_source_name(source)} set rule {rule} to {value}')
-        if rule == 'enableAutoUpdate':
-            try:
-                if value_converted:
-                    sched.resume()
-                else:
-                    sched.pause()
-            except:
-                pass
-        elif rule == 'autoUpdateTime':
-            set_scheduler(source.get_server(), set)
+        init_scheduler(source.get_server())
+
+def check_value(limit: str, value: str):
+    if limit == 'time':
+        try:
+            time.strptime(value, '%H:%M:%S')
+            return value
+        except:
+            return None
+    elif limit == 'bool':
+        if value.lower() not in bool_limit.keys():
+            return None
+        else:
+            return bool_limit[value]
+    elif limit == 'int':
+        try:
+            return int(value)
+        except:
+            return None
 
 def set_scheduler(server: ServerInterface, set = False):
     running = sched.running
@@ -450,16 +455,15 @@ def set_scheduler(server: ServerInterface, set = False):
     sched.remove_all_jobs()
     if set:
         hrs, mins, secs = config["autoUpdateTime"].split(':')
-        sched.add_job(auto_check, 
-        'cron', 
-        args = [server], 
-        id = 'regular', 
+        sched.add_job(auto_check, 'cron', args = [server], id = 'regular', 
         hour = int(hrs), minute = int(mins), second = int(secs))
     if running:
         sched.resume()
 
 def init_scheduler(server: ServerInterface):
     global sched
+    if sched:
+        del sched
     sched = BackgroundScheduler()
     set_scheduler(server, True)
     sched.start()
@@ -467,7 +471,7 @@ def init_scheduler(server: ServerInterface):
         sched.pause()    
 
 def register_stuffs(server: ServerInterface):
-    def permed_literal(literal):   
+    def permed_literal(literal):
         lvl = config['permission'].get(literal, 0)
         return Literal(literal).requires(lambda src: src.has_permission(lvl), failure_message_getter = lambda: f'§f[ServerUpdater] §c权限不足, 你想桃子呢, 需要权限等级{lvl}')
 
@@ -487,7 +491,7 @@ def get_general_path(server: ServerInterface):
     data_folder = server.get_data_folder()
     config_path = os.path.join(data_folder, config_file)
     log_path = os.path.join(data_folder, log_file)
-    backup_folder = os.path.join(data_folder, 'servers')
+    backup_folder = os.path.join(data_folder, backup_dir)
 
 def get_server_path():
     global server_path
