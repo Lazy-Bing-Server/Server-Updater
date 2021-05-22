@@ -1,7 +1,7 @@
 PLUGIN_ID = 'server_updater'
 PLUGIN_METADATA = {
     'id': PLUGIN_ID,
-    'version': '0.2.0-alpha2',
+    'version': '1.0.0',
     'name': 'Server Updater',
     'description': '自动检查并获取服务端更新',
     'author': 'Ra1ny_Yuki',
@@ -18,6 +18,7 @@ from urllib.request import urlopen, urlretrieve
 from mcdreforged.api.all import *
 from zipfile import ZipFile
 from threading import Lock
+from parse import parse
 from ruamel import yaml
 import datetime
 import hashlib
@@ -38,8 +39,9 @@ default_config = {
     'enableAutoUpdate': False,
     'autoUpdateTime': '04:00:00',
     'checkSnapshot': False,
-    'retryInterval': 30,
-    'playerInterruptTimes': 1,
+    'forceAutoUpdate': False,
+    'playerInterruptRetryInterval': 30,
+    'playerInterruptRetryTimes': 1,
     'hashFailRetryTimes': 0,
     'serverPath': 'default',
     'verbose': False,
@@ -50,14 +52,15 @@ default_config = {
         'disable': 2,
         'now': 2,
         'rule': 2
-    },}
+    }}
 rule_description = {
     'enableAutoUpdate': ['启用自动更新', 'bool'],
+    'forceAutoUpdate': ['自动更新时不检查是否有玩家在线', 'bool'],
     'autoUpdateTime': ['每日自动检查更新时间', 'time'],
     'checkSnapshot': ['是否检查快照版本更新', 'bool'],
-    'playerInterruptRetryTimes': ['服务器有人时自动更新中止重试次数(必须大于0)', 'int'],
-    'hashFailRetryTimes': ['下载服务端哈希校验失败重试次数(必须大于0)', 'int'],
-    'retryInterval': ['自动检查更新时有人的再次重试时间/min', 'int']}
+    'playerInterruptRetryTimes': ['服务器非空时更新重试次数§r(§4>0§f)', 'int'],
+    'playerInterruptRetryInterval': ['服务器非空时更新重试间隔§r/分钟', 'int'],
+    'hashFailRetryTimes': ['下载服务端哈希校验失败重试次数§r(§4>0§f)', 'int']}
 config = {}
 general_lock = Lock()
 update_lock = Lock()
@@ -68,7 +71,6 @@ bool_limit = {'true': True, 'false': False}
 class pendingUpdate:
     def __init__(self):
         self.snapshot = config['checkSnapshot']
-        self.refresh_latest()
 
     def is_outdated(self):        
         self.refresh_latest()
@@ -122,9 +124,7 @@ def show_help(source: CommandSource):
 {PLUGIN_METADATA['description']}
 §7{prefix} §r显示此帮助信息
 §7{prefix} reload§r 重载此插件
-§7{prefix} status§r 显示当前版本和更新信息
-§7{prefix} enable§r 启用自动更新
-§7{prefix} disable§r 禁用自动更新
+§7{prefix} status§r 显示当前版本更新信息和插件配置项
 §7{prefix} now§r 立即更新
 '''.strip()
     help_msg_rtext = RTextList()
@@ -231,9 +231,7 @@ def download_server(version: str, loop = 0):
         return
     urlretrieve(verion_js['downloads']['server']['url'], target_path)
     if not sha1_check(target_path, verion_js['downloads']['server']['sha1']):
-        if not config['hashFailRetryTimes'] >= 0:
-            write_config('hashFailRetryTimes', 0)
-        if loop >= config['hashFailRetryTimes']:
+        if loop >= get_integer('hashFailRetryTimes'):
             output_log('Hash check failed for {} too much times!'.format(version + '.jar'))
             os.remove(target_path)
         else:
@@ -265,10 +263,10 @@ def rule_info(rule: str, value = None) -> RTextBase:
     default_value = rclick(f'§7§n{default_config[rule]}§r', '点击此处应用默认值', f'{prefix} {rule} {default_config[rule]}')
     old_value = config[rule]
     current_value = old_value
-    if value:
+    if value is not None:
         current_value = value
     content = f'§e§l{str(current_value)}'
-    if value:
+    if value is not None:
         content += rclick(f'§c§m{str(old_value)}', '点击此处撤销更改', f'{prefix} {rule} {old_value}')
     return server_name + '\n当前值: ' + content + ' 默认值: ' + default_value
     
@@ -278,7 +276,7 @@ def reload_config(source: CommandSource):
     global update
     update = pendingUpdate()
     init_scheduler(source.get_server())
-    print_message(source, '重载配置文件完成')
+    print_message(source, '重载配置文件§a完成§r')
 
 @new_thread(PLUGIN_ID)
 def check_status(source: CommandSource):
@@ -294,58 +292,69 @@ def check_status(source: CommandSource):
     print_message(source, listtext)
 
 @new_thread(PLUGIN_ID)
-def enable_auto():
-    if not sched.running:
-        sched.resume()
-
-@new_thread(PLUGIN_ID)
-def disable_auto():
-    if sched.running:
-        sched.pause()
-
-@new_thread(PLUGIN_ID)
 def auto_check(server: ServerInterface):
     server.say(f'[ServerUpdater] 正在自动检查服务端版本更新(每日§e{config["autoUpdateTime"]}§r)')
-    target_version = update.refresh_latest().is_outdated()
+    if not config['forceAutoUpdate']:
+        server.say('§a请放心, 玩家未下线时不会重启进行更新§r')
+    target_version = update.is_outdated()
     if target_version and not update_lock.locked():
         update_lock.acquire()
         if not os.path.isfile(server_path):
-            server.say(f'检查到有新版本{target_version}, 正在下载, 请放心, 本插件不会在玩家未下线时进行更新')
+            server.say(f'检查到有新版本{target_version}, 正在§e下载§r')
             download_server(target_version)
             general_lock.acquire(blocking = True)
             general_lock.release()
             if not os.path.isfile(server_path):
-                server.say('文件多次完整性校验失败, 自动更新中止')
+                server.say('文件多次完整性校验失败, 自动更新§c中止§r')
             else:
                 server.say('文件下载完成, 即将开始更新')
                 _excute_update(server, target_version)
         else:
-            server.say(f'检查到有新版本{target_version}(已下载), 即将重启执行更新任务')
+            server.say(f'检查到有新版本{target_version}(§e已下载§r)')
             _excute_update(server, target_version)
         update_lock.release()
     elif not target_version and update_lock.locked():
-        server.say('已有正在执行的更新任务了, 自动更新中止')
+        server.say('已有正在执行的更新任务了, 自动更新§c中止§r')
     else:
-        server.say('当前服务端为最新')
+        server.say('当前服务端为§a最新§r')
 
 def _excute_update(server: ServerInterface, target_version: str, loop = 0):
-    empty = not is_player_in(server)
-    if empty:
-        excute_update(server, target_version)
-    elif not empty and loop == 0:
-        debug_log('There\'s still player(s) remaining! Update will retry after {} minute(s)'.format(config['retryInterval']))
-        server.say(f'仍有未下线的玩家, 任务已暂停, §e{config["retryInterval"]}§r分钟后再次尝试')
-        sched.add_job(_excute_update, 'interval', args = (server, target_version, loop + 1), id = 'wait', seconds = int(60 * config['retryInterval']))
-        sched.resume_job('wait')
-        sched.pause_job('regular')
-    else:
-        server.say(f'仍有未下线的玩家, 任务已中止')
-    if not loop == 0:
+    empty = is_server_empty(server)
+    if sched.get_job('wait'):
         sched.remove_job('wait')
         sched.resume_job('regular')
+    if empty:
+        excute_update(server, target_version)
+    elif not empty and loop < get_integer('playerInterruptRetryTimes'):
+        debug_log('There\'s still player(s) remaining! Update will retry after {} minute(s)'.format(config['playerInterruptRetryInterval']))
+        server.say(f'仍有未下线的玩家, 任务已§e暂停§r, §e{config["playerInterruptRetryInterval"]}§r分钟后再次尝试(剩余次数{config["playerInterrruptRetryTimes"] - loop}')
+        sched.add_job(_excute_update, 'interval', args = (server, target_version, loop + 1), id = 'wait', seconds = 60*get_integer('playerInterruptRetryInterval', 1))
+        sched.pause_job('regular')
+    else:
+        server.say(f'仍有未下线的玩家, 任务已§c中止§r')
+        debug_log('There\'s still player(s) remaining! Update interrupted')
+    if not loop <= get_integer('playerInterruptRetryTimes'):
+        if sched.get_job('wait'):
+            sched.remove_job('wait')
+            sched.resume_job('regular')
+
+def get_integer(rule: str, min = 0):
+    value = int(config[rule])
+    if value < min:
+        write_config(rule, min)
+        value = get_integer(rule, min)
+    return value
         
-def is_player_in(server: ServerInterface):
-    return len(server.rcon_query('list').split(' players online:')[1].strip().split(', ')) > 0
+def is_server_empty(server: ServerInterface):
+    if not config['forceAutoUpdate']:
+        return_message = server.rcon_query('list').strip()
+        server.say('即将§e尝试§r执行更新, 正在检查服务器是否有人(服务器有人时不会进行更新)')
+        debug_log(return_message)
+        num = parse('There are {number} of a max of {max} players online{etc}' , return_message)['number']
+        return num == '0'
+    else:
+        server.say('即将§c强制§r执行更新, 请注意!!!')
+        return True
 
 @new_thread(PLUGIN_ID)
 def update_now(source: CommandSource):
@@ -371,7 +380,7 @@ def confirm_update(source: CommandSource, confirm = True):
         print_message(source, '已取消更新请求')
     else:
         required = False
-        print_message(source, '即将开始更新, 请勿关闭服务端', tell = False)
+        print_message(source, '即将开始更新, §c请勿关闭服务端§r', tell = False)
         if sched.get_job('wait'):
             sched.remove_job('wait')
             sched.resume_job('regular')
@@ -380,7 +389,7 @@ def confirm_update(source: CommandSource, confirm = True):
 @new_thread(PLUGIN_ID)
 def _update_now(source: CommandSource):
     server = source.get_server()
-    target_version = update.refresh_latest().is_outdated()
+    target_version = update.is_outdated()
     if not target_version:
         server.say('§c当前版本已是最新版或查询不到当前服务端版本§r')
         return
@@ -390,9 +399,9 @@ def _update_now(source: CommandSource):
         download_server(target_version)
         general_lock.acquire(blocking = True)
         general_lock.release()
-        server.say('下载更新成功, 将开始更新')
+        server.say('下载更新§a成功§r, 将开始更新')
     else:
-        server.say('该版本服务端已下载, 将直接开始更新')
+        server.say('该版本服务端§e已下载§r, 将直接开始更新')
     output_log(f'{get_source_name(source)} started server update manually. Target version: {target_version}')
     excute_update(server, target_version)
     update_lock.release()
@@ -401,9 +410,10 @@ def excute_update(server: ServerInterface, target_version):
     output_log(f'Start updating server to {target_version}')
     num = 5
     while num > 0:
-        num -= 1
-        server.say(f'§c{num}秒将重启服务端执行更新任务§r')
+        server.say(f'§c{num}秒后将重启服务端执行更新任务...§r')
         debug_log(f'Restarting: {num}...')
+        num -= 1
+        time.sleep(1)
     server.stop()
     output_log('Waiting for server stop!')
     server.wait_for_start()
@@ -441,7 +451,7 @@ def check_value(limit: str, value: str):
         if value.lower() not in bool_limit.keys():
             return None
         else:
-            return bool_limit[value]
+            return bool_limit[value.lower()]
     elif limit == 'int':
         try:
             return int(value)
@@ -457,18 +467,22 @@ def set_scheduler(server: ServerInterface, set = False):
         hrs, mins, secs = config["autoUpdateTime"].split(':')
         sched.add_job(auto_check, 'cron', args = [server], id = 'regular', 
         hour = int(hrs), minute = int(mins), second = int(secs))
+    debug_log(f'Scheduler info: ID: regular hour: {int(hrs)} min: {int(mins)} sec: {int(secs)}')
     if running:
         sched.resume()
 
 def init_scheduler(server: ServerInterface):
     global sched
     if sched:
+        sched.remove_all_jobs()
+        sched.shutdown()
         del sched
     sched = BackgroundScheduler()
     set_scheduler(server, True)
     sched.start()
     if not config['enableAutoUpdate']:
-        sched.pause()    
+        sched.pause()
+        debug_log('Scheduler paused')
 
 def register_stuffs(server: ServerInterface):
     def permed_literal(literal):
@@ -513,3 +527,10 @@ def on_load(server: ServerInterface, prev_module):
     update = pendingUpdate()
     init_scheduler(server)
     register_stuffs(server)
+
+def on_unload(server: ServerInterface):
+    global sched
+    if sched:
+        sched.remove_all_jobs()
+        sched.shutdown()
+        del sched
