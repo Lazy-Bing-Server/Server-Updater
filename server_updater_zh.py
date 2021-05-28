@@ -1,7 +1,7 @@
 PLUGIN_ID = 'server_updater'
 PLUGIN_METADATA = {
     'id': PLUGIN_ID,
-    'version': '1.0.0',
+    'version': '1.0.1',
     'name': 'Server Updater',
     'description': '自动检查并获取服务端更新',
     'author': 'Ra1ny_Yuki',
@@ -229,7 +229,10 @@ def download_server(version: str, loop = 0):
         if general_lock.locked() and loop == 0:
             general_lock.release()
         return
-    urlretrieve(verion_js['downloads']['server']['url'], target_path)
+    try:
+        urlretrieve(verion_js['downloads']['server']['url'], target_path)
+    except:
+        pass
     if not sha1_check(target_path, verion_js['downloads']['server']['sha1']):
         if loop >= get_integer('hashFailRetryTimes'):
             output_log('Hash check failed for {} too much times!'.format(version + '.jar'))
@@ -243,10 +246,13 @@ def download_server(version: str, loop = 0):
         general_lock.release()
 
 def sha1_check(file: str, hash: str):
-    sha1 = hashlib.sha1()
-    with open(file, 'rb') as f:
-        sha1.update(f.read())
-    return sha1.hexdigest() == hash
+    try:
+        sha1 = hashlib.sha1()
+        with open(file, 'rb') as f:
+            sha1.update(f.read())
+        return sha1.hexdigest() == hash
+    except:
+        return False
 
 def get_server_version():
     try:
@@ -293,14 +299,16 @@ def check_status(source: CommandSource):
 
 @new_thread(PLUGIN_ID)
 def auto_check(server: ServerInterface):
+    debug_log('Auto checking update...')
     server.say(f'[ServerUpdater] 正在自动检查服务端版本更新(每日§e{config["autoUpdateTime"]}§r)')
     if not config['forceAutoUpdate']:
         server.say('§a请放心, 玩家未下线时不会重启进行更新§r')
     target_version = update.is_outdated()
     if target_version and not update_lock.locked():
         update_lock.acquire()
-        if not os.path.isfile(server_path):
+        if not os.path.isfile(os.path.join(backup_folder, target_version + '.jar')):
             server.say(f'检查到有新版本{target_version}, 正在§e下载§r')
+            debug_log('Downloading {}'.format(target_version))
             download_server(target_version)
             general_lock.acquire(blocking = True)
             general_lock.release()
@@ -319,6 +327,7 @@ def auto_check(server: ServerInterface):
         server.say('当前服务端为§a最新§r')
 
 def _excute_update(server: ServerInterface, target_version: str, loop = 0):
+    debug_log('Trying to execute update')
     empty = is_server_empty(server)
     if sched.get_job('wait'):
         sched.remove_job('wait')
